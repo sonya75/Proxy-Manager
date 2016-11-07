@@ -3,29 +3,55 @@ import subprocess
 import Queue
 from PROXYGUI import *
 from proxychecker import *
+from threading import Thread
 class ProxyManager(MyFrame1):
 	def __init__(self):
 		MyFrame1.__init__(self,None)
 		self.proxylist={}
 		self.totalchecks=0
-		self.MAX_CHECKS=30
+		self.MAX_CHECKS=100
 		self.MAX_PROCESS=30
 		self.totalprocess=0
+		self.totalaccounts=0
+		self.handlelogs=False
+		self.checkingon=False
 		self.checkqueue=Queue.Queue()
 		self.workingproxies=Queue.Queue()
+		self.workinglength=0
 		self.selectedproxy=None
+		self.m_button1.Bind(wx.EVT_BUTTON,self.showaddproxy)
+		self.killsignal=False
 		self.Bind(wx.EVT_CLOSE,self.onclose)
 		self.Bind(wx.dataview.EVT_DATAVIEW_SELECTION_CHANGED,self.showlog)
+	def checkstop(self):
+		if (self.totalprocess>0)|(self.checkingon):
+			wx.CallLater(1000,self.checkstop)
+			return
+		self.killsignal=False
+	def stop(self):
+		self.killsignal=True
+		self.killbroker()
+		self.checkstop()
+	def showaddproxy(self,event):
+		try:
+			path=self.m_filePicker2.GetPath()
+			a=open(path,'r').read().split('\n')
+			for b in a:
+				if b.strip()=='':
+					continue
+				self.addproxy(b.strip())
+		except:
+			pass
 	def onclose(self,event):
 		self.Hide()
 	def addproxy(self,proxy):
 		if proxy in self.proxylist:
 			return
-		self.m_dataViewListCtrl4.AppendItem([proxy,"To be checked","",""])
+		self.m_dataViewListCtrl4.AppendItem([proxy,"Added to checking queue","",""])
 		self.proxylist[proxy]={}
-		self.addtocheckqueue(proxy)
+		self.checkqueue.put(proxy)
 	def deleteproxy(self,proxy):
-		f=self.m_dataViewListCtrl4.GetItemCount()
+		f=self.m_dataViewListCtrl4.ItemCount
 		for i in range(0,f):
 			if self.m_dataViewListCtrl4.GetTextValue(i,0)==proxy:
 				self.m_dataViewListCtrl4.DeleteItem(i)
@@ -45,11 +71,11 @@ class ProxyManager(MyFrame1):
 		startupinfo = subprocess.STARTUPINFO()
 		startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 		try:
-			subprocess.Popen(["TASKKILL","/F","/T","/pid",(self.ProxyBroker.pid)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,startupinfo=startupinfo)
+			subprocess.Popen(["TASKKILL","/F","/T","/pid",str(self.ProxyBroker.pid)],stdout=subprocess.PIPE,stderr=subprocess.STDOUT,startupinfo=startupinfo)
 		except:
 			pass
 	def updateitem(self,proxy,values):
-		f=self.m_dataViewListCtrl4.GetItemCount()
+		f=self.m_dataViewListCtrl4.ItemCount
 		for i in range(0,f):
 			if self.m_dataViewListCtrl4.GetTextValue(i,0)==proxy:
 				for j in range(0,len(values)):
@@ -90,39 +116,79 @@ class ProxyManager(MyFrame1):
 				self.proxylist[val].pop("lastretry",None)
 			self.proxylist[val]["type"]=val1
 			self.workingproxies.put(val)
+			self.workinglength+=1
+			self.m_statusBar1.SetStatusText("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength)+", Accounts created: "+str(self.totalaccounts))
 			self.updateitem(val,["Working","",""])
-	def startchecker(self):
+		if "SCPT" in value:
+			val=value.strip().split("SCPT")[-1]
+			self.workingproxies.put(val)
+			self.workinglength+=1
+			self.m_statusBar1.SetStatusText("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength)+", Accounts created: "+str(self.totalaccounts))
+			self.updateitem(val,["Working","",""])
+		if "EFAIL121" in value:
+			val=value.strip().split("EFAIL121")[-1]
+			wx.CallLater(1000,self.startchecker,immediate=val)
+	#Thread safe version of processproxy
+	def _procprox(self,value):
+		wx.CallAfter(self.processproxy,value)
+	def startchecker(self,immediate=None):
+		self.checkingon=True
 		if self.killsignal:
+			if immediate!=None:
+				self.addtocheckqueue(immediate)
+			self.checkingon=False
 			return
-		if self.totalchecks>=self.MAX_CHECKS:
-			wx.CallLater(1000,self.startchecker)
+		if (self.totalchecks>=self.MAX_CHECKS)&(immediate==None):
+			wx.CallLater(100,self.startchecker)
 			return
 		try:
-			g=self.checkqueue.get_nowait()
+			if immediate!=None:
+				g=immediate
+			else:
+				g=self.checkqueue.get_nowait()
 			t=Thread(target=checkproxy,args=(g,self._procprox))
 			t.daemon=True
 			t.start()
 			self.updateitem(g,["Checking","",""])
 			self.totalchecks+=1
 		except:
-			wx.CallLater(1000,self.startchecker)
+			pass
+		if immediate==None:
+			wx.CallLater(100,self.startchecker)
 	def createcallback(self,proxy,callbk):
 		def f(value):
+			value=str(value)
 			if len(value)>=3:
 				if value[:3]=='8||':
-					callbk(value[3:])
+					wx.CallAfter(callbk,value[3:])
 					return
 			if len(value)>=6:
 				if value[:6]=='|KILL|':
-					wx.CallAfter(self.processproxy,("FAILED259"+proxy))
+					self.totalprocess-=1
+					wx.CallAfter(self.m_statusBar1.SetStatusText,("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength)+", Accounts created: "+str(self.totalaccounts)))
+					wx.CallAfter(self.processproxy,("EFAIL121"+proxy))
 					wx.CallAfter(self.updatelog,proxy,"",setvalue=True)
+					return
+			if len(value)>=8:
+				if value[:8]=='|NOKILL|':
+					self.totalprocess-=1
+					wx.CallAfter(self.m_statusBar1.SetStatusText,("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength)+", Accounts created: "+str(self.totalaccounts)))
+					wx.CallAfter(self.processproxy,("SCPT"+proxy))
+					return
+			if len(value)>=4:
+				if value[:4]=="|9|9":
+					self.totalaccounts+=1
+					wx.CallAfter(self.m_statusBar1.SetStatusText,("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength)+", Accounts created: "+str(self.totalaccounts)))
 					return
 			if "log" not in self.proxylist[proxy]:
 				wx.CallAfter(self.updatelog,proxy,"",setvalue=True)
+			if self.handlelogs:
+				wx.CallAfter(callbk,value)
 			wx.CallAfter(self.updatelog,proxy,value)
 			return
 		return f
 	def updatelog(self,proxy=None,value="",setvalue=False):
+		value=str(value)
 		if proxy==None:
 			h=self.selectedproxy
 			if h not in self.proxylist:
@@ -135,9 +201,10 @@ class ProxyManager(MyFrame1):
 			self.proxylist[proxy]["log"]=value
 			self.updatelog()
 			return
-		self.proxylist[proxy]["log"]+=(value+"\n")
+		e=(self.proxylist[proxy]["log"])+value+"\n"
+		self.proxylist[proxy]["log"]=e
 		if proxy==self.selectedproxy:
-			self.m_textCtrl23.write(value+"\n")
+			self.m_textCtrl23.AppendText(value+"\n")
 	def showlog(self,event):
 		h=self.m_dataViewListCtrl4.GetSelectedRow()
 		if h==wx.NOT_FOUND:
@@ -147,18 +214,25 @@ class ProxyManager(MyFrame1):
 			self.updatelog()
 			return
 	def runprocess(self,func,*args,**kwargs):
+		if self.killsignal:
+			return
 		if self.totalprocess>=self.MAX_PROCESS:
 			wx.CallLater(1000,self.runprocess,func,*args,**kwargs)
 			return
 		try:
 			g=self.workingproxies.get_nowait()
+			self.workinglength-=1
+			wx.CallAfter(self.m_statusBar1.SetStatusText,("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength)+", Accounts created: "+str(self.totalaccounts)))
 		except:
 			wx.CallLater(1000,self.runprocess,func,*args,**kwargs)
 			return
 		self.totalprocess+=1
+		self.m_statusBar1.SetStatusText("Proxies in use: "+str(self.totalprocess)+", Proxies in queue: "+str(self.workinglength))
 		self.updateitem(g,["Working","In Use","Building account. See log for details."])
-		callbk=kwargs.pop("callback",None)
+		kwargs1={c:kwargs[c] for c in kwargs}
+		callbk=kwargs1.pop("callback",None)
 		cb=self.createcallback(g,callbk)
-		t=Thread(target=func,args=(*args,**kwargs,proxy=g,callback=cb))
+		t=Thread(target=func,args=args,kwargs=dict(proxy=g,callback=cb,proxytype=(self.proxylist[g]['type']),checksource=self,**kwargs1))
 		t.daemon=True
 		t.start()
+		wx.CallLater(100,self.runprocess,func,*args,**kwargs)
